@@ -195,3 +195,8 @@ func ExportedClientsetPrefixBlocked(prefix string) bool {
 
 	return blocked
 }
+
+// ExportedCleanupRemovedContext exposes cleanupRemovedContext for testing.
+func ExportedCleanupRemovedContext(k8scache cache.Cache[string], contextKey string) {
+	cleanupRemovedContext(k8scache, contextKey)
+}

@@ -26,6 +26,11 @@ func ResetForTesting() {
 	mu.Unlock()
 
 	clearWatcherRegistriesForTesting()
+
+	if ssarCache != nil {
+		_ = ssarCache.Close()
+		ssarCache = cache.New[bool]()
+	}
 }
 
 func clearWatcherRegistriesForTesting() {

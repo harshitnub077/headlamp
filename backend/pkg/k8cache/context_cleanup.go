@@ -116,9 +116,31 @@ func clientsetCachePrefixFromContextKey(contextKey string) string {
 	return contextKey
 }
 
+// purgeSsarCacheForContext removes all cached SSAR decisions for a removed context.
+func purgeSsarCacheForContext(contextKey string) {
+	if contextKey == "" {
+		return
+	}
+
+	keys, err := ssarCache.GetAll(context.Background(), func(key string) bool {
+		return strings.HasPrefix(key, contextKey+":")
+	})
+	if err != nil {
+		logger.Log(logger.LevelWarn, nil, err, "failed to list SSAR cache keys for context cleanup")
+		return
+	}
+
+	for key := range keys {
+		if err := ssarCache.Delete(context.Background(), key); err != nil {
+			logger.Log(logger.LevelWarn, nil, err, "failed to delete SSAR cache key during context cleanup")
+		}
+	}
+}
+
 // cleanupRemovedContext drops cached API responses and auth clientsets for a
 // context that is no longer active.
 func cleanupRemovedContext(k8scache cache.Cache[string], contextKey string) {
 	PurgeCacheForContext(k8scache, contextKey)
 	EvictClientsetsForCluster(clientsetCachePrefixFromContextKey(contextKey))
+	purgeSsarCacheForContext(contextKey)
 }

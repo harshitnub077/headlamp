@@ -14,8 +14,10 @@
 package k8cache_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -349,4 +351,141 @@ func TestServeFromCacheOrForwardToK8s(t *testing.T) {
 		assert.Equal(t, http.StatusTeapot, w2.Code)
 		assert.Contains(t, w2.Body.String(), "next handler called")
 	})
+}
+
+type testRoundTripper struct {
+	fn func(*http.Request) (*http.Response, error)
+}
+
+func (t *testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.fn(req)
+}
+
+func TestIsAllowedCaching(t *testing.T) {
+	k8cache.ResetForTesting()
+
+	mockK := MockKubeConfig{
+		&kubeconfig.Context{
+			ClusterID:   "/home/user/.kubeconfig+kind-headlamp-admin",
+			Cluster:     &api.Cluster{Server: "https://example.com"},
+			AuthInfo:    &api.AuthInfo{Token: "abcdef"},
+			KubeContext: &api.Context{Cluster: "kind-headlamp-admin"},
+		},
+	}
+
+	jsonResp := `{
+		"apiVersion": "authorization.k8s.io/v1",
+		"kind": "SelfSubjectAccessReview",
+		"status": {
+			"allowed": true
+		}
+	}`
+
+	var calls int
+	rt := &testRoundTripper{
+		fn: func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: 201,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewBufferString(jsonResp)),
+			}, nil
+		},
+	}
+
+	// Override clientset creator to use our custom mock transport
+	restore := k8cache.SetClientsetCreator(func(k *kubeconfig.Context, token string) (*kubernetes.Clientset, error) {
+		restConf, err := k.RESTConfig()
+		if err != nil {
+			return nil, err
+		}
+		restConf.Transport = rt
+		return kubernetes.NewForConfig(restConf)
+	})
+	defer restore()
+
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/kind-headlamp-admin/api/v1/pods", nil)
+	r.Header.Set("Authorization", "Bearer abcdef")
+
+	// Call IsAllowed twice
+	allowed1, err := k8cache.IsAllowed("kind-headlamp-admin", mockK.Context, r)
+	assert.NoError(t, err)
+	assert.True(t, allowed1)
+
+	allowed2, err := k8cache.IsAllowed("kind-headlamp-admin", mockK.Context, r)
+	assert.NoError(t, err)
+	assert.True(t, allowed2)
+
+	// Assert that only 1 HTTP call was made because the second was served from cache
+	assert.Equal(t, 1, calls)
+
+	// Switch token, it should bypass the cache and make another call
+	r2 := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/kind-headlamp-admin/api/v1/pods", nil)
+	r2.Header.Set("Authorization", "Bearer othertoken")
+
+	allowed3, err := k8cache.IsAllowed("kind-headlamp-admin", mockK.Context, r2)
+	assert.NoError(t, err)
+	assert.True(t, allowed3)
+	assert.Equal(t, 2, calls)
+}
+
+func TestPurgeSsarCacheOnContextCleanup(t *testing.T) {
+	k8cache.ResetForTesting()
+
+	mockK := MockKubeConfig{
+		&kubeconfig.Context{
+			ClusterID:   "/home/user/.kubeconfig+kind-headlamp-admin",
+			Cluster:     &api.Cluster{Server: "https://example.com"},
+			AuthInfo:    &api.AuthInfo{Token: "abcdef"},
+			KubeContext: &api.Context{Cluster: "kind-headlamp-admin"},
+		},
+	}
+
+	jsonResp := `{
+		"apiVersion": "authorization.k8s.io/v1",
+		"kind": "SelfSubjectAccessReview",
+		"status": {
+			"allowed": true
+		}
+	}`
+
+	var calls int
+	rt := &testRoundTripper{
+		fn: func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: 201,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewBufferString(jsonResp)),
+			}, nil
+		},
+	}
+
+	restore := k8cache.SetClientsetCreator(func(k *kubeconfig.Context, token string) (*kubernetes.Clientset, error) {
+		restConf, err := k.RESTConfig()
+		if err != nil {
+			return nil, err
+		}
+		restConf.Transport = rt
+		return kubernetes.NewForConfig(restConf)
+	})
+	defer restore()
+
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/kind-headlamp-admin/api/v1/pods", nil)
+	r.Header.Set("Authorization", "Bearer abcdef")
+
+	// Call IsAllowed to populate cache
+	allowed, err := k8cache.IsAllowed("kind-headlamp-admin", mockK.Context, r)
+	assert.NoError(t, err)
+	assert.True(t, allowed)
+	assert.Equal(t, 1, calls)
+
+	// Clean up context, this should clear the clientset cache and the SSAR cache
+	k8cache.ExportedCleanupRemovedContext(k8cache.New[string](), "kind-headlamp-admin")
+
+	// Call IsAllowed again, it should have to re-evaluate (make a new HTTP call) since the cache was purged
+	allowed2, err := k8cache.IsAllowed("kind-headlamp-admin", mockK.Context, r)
+	assert.NoError(t, err)
+	assert.True(t, allowed2)
+	assert.Equal(t, 2, calls)
 }

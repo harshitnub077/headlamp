@@ -20,6 +20,7 @@
 package k8cache
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -41,6 +42,11 @@ import (
 // clientsetTTL is how long an idle clientset stays in the cache before
 // it becomes eligible for eviction.
 const clientsetTTL = 10 * time.Minute
+
+// ssarTTL is how long an SSAR result stays in the cache.
+const ssarTTL = 30 * time.Second
+
+var ssarCache = cache.New[bool]()
 
 const unknownVerb = "unknown"
 
@@ -522,6 +528,24 @@ func getResourceAttributes(r *http.Request) (*authorizationv1.ResourceAttributes
 	}, nil
 }
 
+func getSsarCacheKey(headlampContextKey, token string, attr *authorizationv1.ResourceAttributes) string {
+	if attr == nil {
+		return ""
+	}
+	tokenHash := fmt.Sprintf("%x", sha256.Sum256([]byte(token)))
+	return fmt.Sprintf("%s:%s:%s:%s:%s:%s:%s:%s:%s",
+		headlampContextKey,
+		tokenHash,
+		attr.Group,
+		attr.Version,
+		attr.Resource,
+		attr.Subresource,
+		attr.Namespace,
+		attr.Name,
+		attr.Verb,
+	)
+}
+
 // IsAllowed checks the user's permission to access the resource.
 // If the user is authorized and has permission to view the resources, it returns true.
 // Otherwise, it returns false if authorization fails.
@@ -532,12 +556,20 @@ func IsAllowed(
 ) (bool, error) {
 	token := auth.BearerTokenValue(r.Header.Get("Authorization"))
 
-	clientset, err := GetClientSet(headlampContextKey, k, token)
+	resourceAttributes, err := getResourceAttributes(r)
 	if err != nil {
 		return false, err
 	}
 
-	resourceAttributes, err := getResourceAttributes(r)
+	// Try loading from cache first
+	cacheKey := getSsarCacheKey(headlampContextKey, token, resourceAttributes)
+	if cacheKey != "" {
+		if allowed, err := ssarCache.Get(r.Context(), cacheKey); err == nil {
+			return allowed, nil
+		}
+	}
+
+	clientset, err := GetClientSet(headlampContextKey, k, token)
 	if err != nil {
 		return false, err
 	}
@@ -561,7 +593,14 @@ func IsAllowed(
 		return false, fmt.Errorf("nil SelfSubjectAccessReview result")
 	}
 
-	return result.Status.Allowed, err
+	allowed := result.Status.Allowed
+
+	// Store in cache
+	if cacheKey != "" {
+		_ = ssarCache.SetWithTTL(r.Context(), cacheKey, allowed, ssarTTL)
+	}
+
+	return allowed, nil
 }
 
 // ServeFromCacheOrForwardToK8s attempts to serve a Kubernetes resource from cache.
