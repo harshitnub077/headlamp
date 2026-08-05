@@ -17,14 +17,23 @@
 import { EventEmitter } from 'events';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, Mock, vi } from 'vitest';
+import { loadSettings, saveSettings } from './settings';
 
-const { getShellEnvironmentMock, spawnMock } = vi.hoisted(() => ({
+const { getShellEnvironmentMock, spawnMock, mockShowMessageBoxSync } = vi.hoisted(() => ({
   getShellEnvironmentMock: vi.fn(),
   spawnMock: vi.fn(),
+  mockShowMessageBoxSync: vi.fn(),
 }));
 
 vi.mock('child_process', () => ({
   spawn: spawnMock,
+}));
+
+vi.mock('electron', () => ({
+  dialog: {
+    showMessageBoxSync: mockShowMessageBoxSync,
+  },
+  BrowserWindow: class {},
 }));
 
 vi.mock('./plugin-management', () => ({
@@ -289,6 +298,8 @@ describe('handleRunCommand', () => {
         send: vi.fn((...args: [string, ...unknown[]]) => sentMessages.push(args)),
       },
     } as any;
+    mockShowMessageBoxSync.mockReset();
+    vi.mocked(saveSettings).mockReset();
   });
 
   afterEach(() => {
@@ -361,6 +372,62 @@ describe('handleRunCommand', () => {
       ['auth', 'token'],
       expect.objectContaining({
         env: expect.objectContaining({ HEADLAMP_TEST_ENV: 'current' }),
+      })
+    );
+  });
+
+  it('blocks command execution and saves denial on first prompt when user clicks Deny', async () => {
+    vi.mocked(loadSettings).mockReturnValue({
+      confirmedCommands: {},
+    });
+    mockShowMessageBoxSync.mockReturnValue(1); // 1 = Deny
+
+    const fakeMainWindow = { id: 1 } as any;
+    const permissionSecrets = { 'runCmd-gh': 99 };
+    const eventData = {
+      id: 'test-id',
+      command: 'gh',
+      args: ['auth', 'token'],
+      options: {},
+      permissionSecrets: { 'runCmd-gh': 99 },
+    };
+
+    await handleRunCommand(fakeEvent, eventData, fakeMainWindow, permissionSecrets);
+
+    expect(mockShowMessageBoxSync).toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(saveSettings).toHaveBeenCalledWith(
+      '/fake/settings.json',
+      expect.objectContaining({
+        confirmedCommands: { 'gh auth': false },
+      })
+    );
+  });
+
+  it('allows command execution and saves approval on first prompt when user clicks Allow', async () => {
+    vi.mocked(loadSettings).mockReturnValue({
+      confirmedCommands: {},
+    });
+    mockShowMessageBoxSync.mockReturnValue(0); // 0 = Allow
+
+    const fakeMainWindow = { id: 1 } as any;
+    const permissionSecrets = { 'runCmd-gh': 99 };
+    const eventData = {
+      id: 'test-id',
+      command: 'gh',
+      args: ['auth', 'token'],
+      options: {},
+      permissionSecrets: { 'runCmd-gh': 99 },
+    };
+
+    await handleRunCommand(fakeEvent, eventData, fakeMainWindow, permissionSecrets);
+
+    expect(mockShowMessageBoxSync).toHaveBeenCalled();
+    expect(spawnMock).toHaveBeenCalled();
+    expect(saveSettings).toHaveBeenCalledWith(
+      '/fake/settings.json',
+      expect.objectContaining({
+        confirmedCommands: { 'gh auth': true },
       })
     );
   });

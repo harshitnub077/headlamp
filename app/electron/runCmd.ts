@@ -109,6 +109,7 @@ function checkCommandConsent(command: string, args: string[], mainWindow: Browse
     }
     settings.confirmedCommands[consentKey] = commandChoice;
     saveSettings(SETTINGS_PATH, settings);
+    return commandChoice;
   }
   return true;
 }
